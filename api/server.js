@@ -31,6 +31,7 @@ import {
 } from './passkeys-store.js';
 import { createDeviceLink, findDeviceLink, burnDeviceLink, dropDeviceLinks } from './device-link.js';
 import { createMediaStore, mediaLimits, mediaConfig, MediaError, HASH_RE } from './media.js';
+import * as storage from './storage.js';
 
 const PORT = +(process.env.PORT || 3000);
 const DATA = process.env.DATA_DIR || '/data';
@@ -89,60 +90,43 @@ fs.mkdirSync(DATA, { recursive: true });
 const lock = f => { try { fs.chmodSync(path.join(DATA, f), 0o600); } catch { /* not present yet, or host says no */ } };
 ['secret', 'db.json', 'coach.json'].forEach(lock);
 
-/* ---------- secret + db ---------- */
-const secretFile = path.join(DATA, 'secret');
-if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
-const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
+/* ---------- secret + db (unified storage: Turso or local fs) ---------- */
+await storage.initStorage({
+  dataDir: DATA,
+  origin: ORIGIN,
+  secure: !/^(0|false|no|off)$/i.test(process.env.SECURE || (ORIGIN.startsWith('https:') ? '1' : '0')),
+  adminUids: ADMIN_UIDS
+});
 
-const dbFile = path.join(DATA, 'db.json');
-let db = { users: [], creds: [], subs: [], invites: [] };
-try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
-db.subs = db.subs || [];
-db.invites = db.invites || [];
-db.deviceLinks = db.deviceLinks || [];   // unused one-time device links, hashed (device-link.js)
+const SECRET = storage.SECRET;
+const db = storage.db;
+const vapid = storage.vapid;
 const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
-// 0600: db.json holds passkey credential material. It used to be covered by a blanket 0700 on
-// the whole directory; now that the directory stays traversable, the file carries its own mode.
-function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2), 0o600); }
+
+function saveDb() {
+  return storage.saveDb(db).catch(e => console.error('db save failed', e.message));
+}
 function atomicWrite(file, content, mode) {
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, content, mode ? { mode } : undefined);
   fs.renameSync(tmp, file);
 }
 const stateFile = uid => path.join(DATA, 'state-' + uid.replace(/[^a-zA-Z0-9_-]/g, '') + '.json');
-// When a profile last fetched its document (GET /api/data). The document's own `_ts` moves only
-// on a push, so a device that only ever read — a second phone, a profile that trains elsewhere
-// and just looks — showed "last sync never" in the admin dashboard (QA 1.3.9). Kept on the user
-// record and written at most every ten minutes per profile, since every foreground return pulls.
+
 const PULL_NOTE_MS = 10 * 60 * 1000;
 function notePull(user, now = Date.now()) {
   if (user.lastPull && now - user.lastPull < PULL_NOTE_MS) return;
   user.lastPull = now;
   try { saveDb(); } catch (e) { console.error('db save failed', e.message); }
 }
-// The later of the last push and the last pull.
 const lastSyncOf = (u, S) => Math.max(S?._ts || 0, u?.lastPull || 0) || null;
+
 function readState(uid) {
-  try { return JSON.parse(fs.readFileSync(stateFile(uid), 'utf8')); } catch { return null; }
+  return storage.readState(uid);
 }
-// An entry is an object a reader can dereference, and `records` is every entry of a stored
-// list. PUT /api/data drops the rest on the way in — a null workout, a routine that is a
-// number — and refuses a list that is not an array at all, but a file written before it did
-// answers to nobody, and the readers below walk those lists (`r.id`, `w.d`, `.slice()`). One
-// throw inside an admin route is a 500 for that whole profile: the drill-down never leaves
-// "Loading…", the Disable button lives inside it, and the account an operator opened the
-// dashboard to stop is exactly the one they then cannot. Answering with the entries that are
-// there is the honest reading of such a file — what was dropped carried nothing to show.
+
 const record = x => !!x && typeof x === 'object' && !Array.isArray(x);
 const records = v => (Array.isArray(v) ? v.filter(record) : []);
-
-/* ---------- push notifications (Web Push / VAPID) ---------- */
-const vapidFile = path.join(DATA, 'vapid.json');
-let vapid;
-try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
-catch { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 }); }
-const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:admin@localhost');
-webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
 
 /* A push subscription's `endpoint` is a URL this server connects out to, chosen by whoever is
    signed in — so without a check /api/push/* is a request-forgery lever, and the api container
@@ -575,34 +559,18 @@ function csrfOk(req, key) {
 // POST /api/device-link/options hands to anyone holding a code finished a *sign-up* instead: a
 // passkey on the owner's profile and a session for it, without using the code up, as often as
 // wanted, and past "sign out everywhere".
-const challenges = new Map(); // cid -> {kind, challenge, name?, uid?, exp}
-function putChallenge(data) {
-  const cid = crypto.randomBytes(16).toString('base64url');
-  challenges.set(cid, { ...data, exp: Date.now() + 5 * 60000 });
-  return cid;
+async function putChallenge(data) {
+  return storage.putChallenge(data);
 }
-function takeChallenge(cid) {
-  const c = challenges.get(cid);
-  challenges.delete(cid);
-  if (!c || c.exp < Date.now()) return null;
-  return c;
+async function takeChallenge(cid) {
+  return storage.takeChallenge(cid);
 }
-setInterval(() => { for (const [k, v] of challenges) if (v.exp < Date.now()) challenges.delete(k); }, 60000).unref();
 
 // ---------- device pairing (mobile app "connect to my server", no WebAuthn ceremony) ----------
-// A passkey ceremony can't run inside the app's WebView (its origin never matches RP_ID), so the
-// app authenticates by redeeming a short code minted from an already signed-in browser tab —
-// same 5-min-TTL/one-shot shape as the WebAuthn challenge store above.
-const pairings = new Map(); // code -> {uid, exp}
 const PAIR_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I — read off a screen
 function makePairCode() {
-  let code;
-  do {
-    code = Array.from(crypto.randomBytes(8)).map(b => PAIR_CODE_ALPHABET[b % PAIR_CODE_ALPHABET.length]).join('');
-  } while (pairings.has(code));
-  return code;
+  return Array.from(crypto.randomBytes(8)).map(b => PAIR_CODE_ALPHABET[b % PAIR_CODE_ALPHABET.length]).join('');
 }
-setInterval(() => { for (const [k, v] of pairings) if (v.exp < Date.now()) pairings.delete(k); }, 60000).unref();
 
 /* ---------- helpers ---------- */
 function json(res, code, obj, extraHeaders) {
@@ -761,14 +729,20 @@ function audit(req, ev, f = {}) {
   if (f.act) rec.act = String(f.act).slice(0, 40);
   const ip = clientIp(req);
   if (ip) rec.ip = ip;
-  try { fs.appendFileSync(auditFile, JSON.stringify(rec) + '\n'); }
-  catch (e) { return console.error('audit write failed', e.message); }
-  // Amortized: a 5000-event cap rewrites the file once per ~1250 events.
-  if (AUDIT_MAX && ++auditCount > AUDIT_MAX * 1.25) compactAudit();
+  if (storage.isTurso) {
+    storage.appendAudit(rec).catch(() => {});
+  } else {
+    try { fs.appendFileSync(auditFile, JSON.stringify(rec) + '\n'); }
+    catch (e) { return console.error('audit write failed', e.message); }
+    // Amortized: a 5000-event cap rewrites the file once per ~1250 events.
+    if (AUDIT_MAX && ++auditCount > AUDIT_MAX * 1.25) compactAudit();
+  }
 }
 if (AUDIT_ON) {
-  compactAudit();                                // prune on boot, seed auditSeq/auditCount
-  setInterval(compactAudit, 3600000).unref();    // honour AUDIT_DAYS on an idle instance too
+  if (!storage.isTurso) {
+    compactAudit();                                // prune on boot, seed auditSeq/auditCount
+    setInterval(compactAudit, 3600000).unref();    // honour AUDIT_DAYS on an idle instance too
+  }
 }
 
 /* ---------- sign-in throttle ---------- */
@@ -978,7 +952,7 @@ function setPassword(user, h) {
 // outlives "sign out everywhere". Same ceremony as /api/login/verify, and the credential has
 // to belong to this account.
 async function passkeyStepUp(user, body) {
-  const c = takeChallenge(body.cid);
+  const c = await takeChallenge(body.cid);
   const cred = c?.kind === 'login' && db.creds.find(x => x.id === body.credential?.id && x.userId === user.id);
   if (!cred) return false;
   try {
@@ -1458,7 +1432,7 @@ const passkeyRoutes = {
     if (readSession(req) !== user) return notSignedIn(res);
     if (proof === 'passkey') saveDb();   // the confirming passkey's counter and last use
     const options = await moreOptions(user);
-    const cid = putChallenge({ challenge: options.challenge, uid: user.id, kind: 'add', sv: sessionVersion(user), proof });
+    const cid = await putChallenge({ challenge: options.challenge, uid: user.id, kind: 'add', sv: sessionVersion(user), proof });
     json(res, 200, { cid, options });
   },
 
@@ -1466,7 +1440,7 @@ const passkeyRoutes = {
     const user = readSession(req);
     if (!user) return notSignedIn(res);
     const body = await readBody(req);
-    const c = takeChallenge(text(body.cid));
+    const c = await takeChallenge(text(body.cid));
     if (!c || c.kind !== 'add' || c.uid !== user.id) {
       audit(req, 'auth.passkey.fail', { ok: false, user, msg: 'challenge-expired' });
       return json(res, 400, { error: 'challenge expired — try again' });
@@ -1562,7 +1536,7 @@ const passkeyRoutes = {
     }
     if (passkeyCount(user) >= MAX_PASSKEYS) return json(res, 409, LIMIT);
     const options = await moreOptions(user);
-    const cid = putChallenge({ challenge: options.challenge, uid: user.id, kind: 'link', lh: link.h });
+    const cid = await putChallenge({ challenge: options.challenge, uid: user.id, kind: 'link', lh: link.h });
     json(res, 200, { cid, options, id: user.id, name: user.name });
   },
 
@@ -1573,7 +1547,7 @@ const passkeyRoutes = {
     const body = await readBody(req);
     if (addressPaused(req, res, 'link')) return;
     const code = text(body.code);
-    const c = takeChallenge(text(body.cid));
+    const c = await takeChallenge(text(body.cid));
     const link = findDeviceLink(db, code);
     if (!link) {
       strikeAddress(req, 'link');
@@ -1797,13 +1771,13 @@ const routes = {
       authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
       excludeCredentials: []
     });
-    const cid = putChallenge({ kind: 'register', challenge: options.challenge, name, uid, code });
+    const cid = await putChallenge({ kind: 'register', challenge: options.challenge, name, uid, code });
     json(res, 200, { cid, options });
   },
 
   'POST /api/register/verify': async (req, res) => {
     const body = await readBody(req);
-    const c = takeChallenge(body.cid);
+    const c = await takeChallenge(body.cid);
     if (!c || c.kind !== 'register' || !c.uid) {
       audit(req, 'auth.register.fail', { ok: false, msg: 'challenge-expired' });
       return json(res, 400, { error: 'challenge expired — try again' });
@@ -1860,13 +1834,13 @@ const routes = {
     const options = await generateAuthenticationOptions({
       rpID: RP_ID, userVerification: 'preferred', allowCredentials: []
     });
-    const cid = putChallenge({ kind: 'login', challenge: options.challenge });
+    const cid = await putChallenge({ kind: 'login', challenge: options.challenge });
     json(res, 200, { cid, options });
   },
 
   'POST /api/login/verify': async (req, res) => {
     const body = await readBody(req);
-    const c = takeChallenge(body.cid);
+    const c = await takeChallenge(body.cid);
     if (c?.kind !== 'login') {
       audit(req, 'auth.login.fail', { ok: false, msg: 'challenge-expired' });
       return json(res, 400, { error: 'challenge expired — try again' });
@@ -1949,7 +1923,7 @@ const routes = {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const code = makePairCode();
-    pairings.set(code, { uid: user.id, exp: Date.now() + 5 * 60000 });
+    await storage.putPairing(code, { uid: user.id, exp: Date.now() + 5 * 60000 });
     audit(req, 'auth.pair.create', { user });
     json(res, 200, { code });
   },
@@ -1959,8 +1933,7 @@ const routes = {
   'POST /api/pair/redeem': async (req, res) => {
     const body = await readBody(req);
     const code = text(body.code).trim().toUpperCase();
-    const p = pairings.get(code);
-    if (p) pairings.delete(code);
+    const p = await storage.takePairing(code);
     if (!p || p.exp < Date.now()) {
       audit(req, 'auth.pair.fail', { ok: false, msg: 'code-invalid' });
       return json(res, 400, { error: 'invalid or expired code' });
@@ -2055,7 +2028,7 @@ const routes = {
       else delete body.state.resetIds;
     }
     body.state._rev = curRev + 1;          // server-owned; whatever the client sent is ignored
-    atomicWrite(stateFile(user.id), JSON.stringify(body.state));
+    await storage.saveState(user.id, body.state);
     // The stat cache cannot see this write on its own: mtime granularity is 4 ms here (ext4 on
     // this kernel — 3901 of 3999 back-to-back same-size writes shared one timestamp), and a
     // `_rev` going from 7 to 8 does not change the file's size, so two writes inside one 4 ms
@@ -2253,7 +2226,7 @@ const routes = {
     dropDeviceLinks(db, u.id);
     presence.delete(u.id);
     // The training history and any Coach credential of theirs, both outside db.json.
-    try { fs.unlinkSync(stateFile(u.id)); } catch { /* already gone */ }
+    await storage.deleteState(u.id);
     try { coachConfig.clearProfileAuth(u.id); } catch { /* nothing stored */ }
     // Their photos and videos — the one place a profile's folder under uploads/ is removed.
     try { MEDIA.removeUser(u.id); } catch (e) { console.error('media: could not remove uploads of', u.id, e.message); }
@@ -2311,7 +2284,7 @@ const routes = {
     const limit = Math.max(1, Math.min(200, +q.get('limit') || 100));
     const before = +q.get('before') || Infinity;
     const cat = q.get('cat') || '';
-    let rows = auditKeep(auditLines()).reverse();
+    let rows = storage.isTurso ? (await storage.readAudit(AUDIT_MAX || 5000, AUDIT_DAYS || 90)) : auditKeep(auditLines()).reverse();
     if (cat === 'fail') rows = rows.filter(r => !r.ok);
     else if (cat) rows = rows.filter(r => String(r.ev).startsWith(cat + '.'));
     const page = rows.filter(r => r.id < before).slice(0, limit);
@@ -2330,7 +2303,11 @@ const routes = {
   // ./data/audit.log already is the export, in a format jq reads directly.
   'POST /api/admin/audit/clear': async (req, res) => {
     const admin = requireAdmin(req, res); if (!admin) return;
-    try { fs.unlinkSync(auditFile); } catch { /* nothing logged yet */ }
+    if (storage.isTurso) {
+      await storage.clearAudit();
+    } else {
+      try { fs.unlinkSync(auditFile); } catch { /* nothing logged yet */ }
+    }
     auditCount = 0;
     audit(req, 'admin.audit.clear', { user: admin });
     json(res, 200, { ok: true });
@@ -2387,7 +2364,8 @@ function bodyDeadline(req) {
   req.allowSlowBody = clear;
 }
 
-const server = http.createServer(async (req, res) => {
+export async function handleRequest(req, res) {
+  await storage.ensureDbFresh();
   bodyDeadline(req);
   // Same-origin (the deployed nginx-proxied web app) never triggers CORS, so this only matters
   // for the paired mobile app calling in from its own WebView origin. It carries no cookie
@@ -2450,7 +2428,9 @@ const server = http.createServer(async (req, res) => {
     console.error(key, e);
     if (!res.headersSent) json(res, 500, { error: 'server error' });
   }
-});
+}
+
+const server = http.createServer(handleRequest);
 // Node's default of 300 s for a whole request would answer 408 to a 40 MB video on a ~1 Mbit/s
 // uplink. Half an hour covers that; a stalled upload is cut much sooner by its own 60 s idle
 // timer in media.js, a client that never finishes its headers still meets headersTimeout, and
@@ -2461,4 +2441,9 @@ server.headersTimeout = 60000;
 // port that was actually bound: with PORT=0 the OS picks one, and a caller that did not choose it
 // (the tests spawn the server that way, and so does anyone running two instances on one box) has
 // no other way to learn it.
-server.listen(PORT, () => console.log(`gym-api on :${server.address().port} (rpID=${RP_ID}, origin=${ORIGIN})`));
+if (!process.env.VERCEL) {
+  server.listen(PORT, () => console.log(`gym-api on :${server.address().port} (rpID=${RP_ID}, origin=${ORIGIN})`));
+}
+
+export { server };
+export default handleRequest;
